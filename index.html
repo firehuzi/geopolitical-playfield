@@ -112,11 +112,17 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 </head>
 <body>
 <div id="app">
-  <div class="header"><h1>📜 地缘推演台 — 历史回溯版 V2</h1><p class="sub">地缘政治飞行模拟器——<br>用当时的已知信息做判断，然后看历史怎么走的。<br><strong>事后诸葛亮是廉价的，事前判断才是真功夫。</strong></p></div>
+  <div class="header"><h1>📜 地缘推演台 — 历史回溯版 V2</h1><p class="sub">地缘政治飞行模拟器——<br>用当时的已知信息做判断，然后看历史怎么走的。<br><strong>事后诸葛亮是廉价的，事前判断才是真功夫。</strong></p>
+    <!-- ★ 版本戳：用户三次导出都来自旧版而我们只能靠推断。
+         现在把「这份页面到底是哪个构建」印在脸上，不再靠猜。 -->
+    <div class="hint" id="build-stamp" style="margin-top:10px;font-size:11px"></div>
+  </div>
 
   <!-- SCENARIO SELECTION -->
   <div id="scenario-select">
     <div class="scenario-grid" id="scenario-grid"></div>
+    <!-- 历史推演记录挂在这里（用户报「没有历史推演记录」） -->
+    <div id="history-holder"></div>
   </div>
 
   <!-- BACKTEST FLOW (hidden initially) -->
@@ -126,9 +132,13 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
     <div class="step-content" id="step-content"></div>
     <div class="nav">
       <button class="btn" id="btn-prev" onclick="prevStep()">← 上一步</button>
+      <!-- ★ 提交按钮。第 4 步它会变成「提交本次推演（写入历史）」，
+           而且【必须】先提交才能揭示历史 —— 不再被「揭示历史」替代。 -->
+      <button class="btn" id="btn-commit" onclick="navCommit()">✔ 保存本步</button>
       <span id="nav-spacer"></span>
       <button class="btn btn-primary" id="btn-next" onclick="nextStep()">下一步 →</button>
     </div>
+    <div id="save-status" class="hint" style="text-align:center;min-height:18px"></div>
     <div class="reveal-section" id="reveal-section"></div>
   </div>
 </div>
@@ -316,13 +326,123 @@ let state = {
   constraintsNotes:'',
   externalsNotes:'',
   paths:[],
+  // ★ 新增：排除断言（「什么不可能发生」）。
+  //   与 paths（我预测会发生什么）互补 —— 而且更好测：
+  //   预测需要未来数据；排除是【单向可证伪】的，X 发生了就证伪，不必等未来。
+  exclusions:[],
   userAnswers:{}  // NEW: guided question answers
 };
+
+// ============================================================
+// 排除断言：纯函数，可自证
+// ============================================================
+// ★ 为什么【必须】要求 criterion（「什么算它发生了」）：
+//   没有判据的排除断言不可证伪 —— 而不可证伪的断言和不可证伪的预测一样，
+//   【不携带信息】。所以这里刻意把它标出来，不静默放过。
+//   写下时补一句判据的代价是零；几个月后从散文里回头抽，代价就是口径不清。
+const EXCLUSION_SCHEMA = 'construct-exclusion-v1';
+
+// ★ 构建指纹。用户三次导出都来自旧版，而我们只能靠字段推断 —— 那次推断花了好几轮。
+//   现在把「这份页面是哪个构建、有哪些功能」直接印在页面上，一眼可核。
+//   改动工具时【必须】同时改这里，否则戳会说谎。
+const BUILD = {
+  id: 'b7-commit-history',           // 构建标识
+  date: '2026-10-02',
+  features: [                        // 有这些 = 你打开的是这份
+    '排除断言栏（含证伪条件填空题）',
+    '判据对不对题检查（词面重叠）',
+    '✔ 提交本次推演（写入历史、锁定）',
+    '未提交不许揭示历史',
+    '📚 历史推演记录（场景页）',
+    '导出排除断言 / 导出全部历史',
+    '自由笔记与决策时间点可保存回填',
+  ],
+};
+function renderBuildStamp() {
+  const el = document.getElementById('build-stamp');
+  if (!el) return;
+  el.innerHTML = '构建 <strong>' + BUILD.id + '</strong> · ' + BUILD.date
+    + '　｜　应有功能：' + BUILD.features.join(' ／ ')
+    + '　｜　<strong style="color:var(--danger)">若你看到的页面【没有】上面这些，'
+    + '说明你打开的是旧版（按 Ctrl+F5 强制刷新）</strong>';
+}
+
+// ★ 判据与被排除路径的【词面重叠度】。
+//   加这个是因为第一个真实记录就撞上了：excluded=「危机局势进一步加剧 进入核战前奏」/
+//   criterion=「互撤导弹」—— 后者不是前者的判据，它恰恰是【反面】（双方各退一步）。
+//   那其实是一个【路径预测】被填进了判据栏。
+//   ⚠️ 这是粗筛不是判决：语义等价可以零重叠。所以零重叠只报「请确认」，不判错。
+//   ★★ 这里踩过一个严重的坑：JS 的 `\W`【不是】Unicode 感知的（Python 的是）。
+//      我最初写 .replace(/[\s\W_]+/g,'')，结果把中文字【全部剥光】——
+//      任何中文判据都算 0 重叠 ⇒【每一条都被误报「不对题」】。
+//      改用 Unicode 属性转义 \p{L}\p{N}（保留各语言文字与数字）。
+function criterionOverlap(excluded, criterion) {
+  const bg = s => {
+    const t = (s || '').replace(/[^\p{L}\p{N}]/gu, '');
+    const o = [];
+    if (t.length < 2) { if (t) o.push(t); return o; }
+    for (let i = 0; i < t.length - 1; i++) o.push(t.slice(i, i + 2));
+    return o;
+  };
+  const a = bg(excluded), b = bg(criterion);
+  if (!a.length || !b.length) return 0;
+  const bs = new Set(b);
+  let inter = 0;
+  a.forEach(x => { if (bs.has(x)) inter++; });
+  return inter / Math.min(a.length, b.length);
+}
+
+function buildExclusionRecord(bt, st, nowISO) {
+  const items = (st.exclusions || []).map((x, i) => {
+    const excluded = (x.excluded || '').trim();
+    const criterion = (x.criterion || '').trim();
+    const win = (x.window || '').trim();
+    const ov = criterionOverlap(excluded, criterion);
+    const mismatch = !!criterion && ov === 0;
+    return {
+      id: (bt.id || 'bt') + '-X' + String(i + 1).padStart(2, '0'),
+      scenario: bt.name,
+      time_point: bt.timePoint,
+      excluded: excluded,
+      criterion: criterion,
+      window: win || null,
+      criterion_overlap: ov,
+      falsifiable: !!criterion && !mismatch,
+      criterion_mismatch: mismatch,
+      verdict_at_write: !criterion ? '不可证伪 ⇒ 不携带信息'
+                       : (mismatch ? '判据可能不对题 ⇒ 需人工确认' : '尚未被证伪（写下时）'),
+      note: !criterion ? '缺判据：请写清「出现什么就说明我排除的这件事发生了」，否则这条断言无法被检验'
+            : (mismatch ? '判据与被排除的路径零词面重叠：你可能把「我认为会怎么走」填进来了。'
+                          + '判据要填【证伪条件】，不是路径预测。' : '')
+    };
+  });
+  const bad = items.filter(x => !x.falsifiable);
+  const mis = items.filter(x => x.criterion_mismatch);
+  const noWin = items.filter(x => x.falsifiable && !x.window);
+  return {
+    schema: EXCLUSION_SCHEMA,
+    exported_at: nowISO,
+    scenario: bt.name,
+    scenario_id: bt.id,
+    time_lock: bt.timePoint,
+    exclusions: items,
+    summary: {
+      total: items.length,
+      falsifiable: items.filter(x => x.falsifiable).length,
+      unfalsifiable: items.filter(x => !x.falsifiable).length,
+      unfalsifiable_ids: bad.map(x => x.id),
+      criterion_mismatch: mis.length,
+      criterion_mismatch_ids: mis.map(x => x.id),
+      missing_window_ids: noWin.map(x => x.id)
+    }
+  };
+}
 
 // ============================================================
 // INIT
 // ============================================================
 function init() {
+  renderBuildStamp();
   renderScenarioGrid();
 }
 init();
@@ -337,6 +457,10 @@ function renderScenarioGrid() {
       <div class="meta"><span>🏷️ ${bt.tag}</span><span>📚 ${bt.actualOutcome.keyFactors.length} 个关键因素</span></div>
     </div>
   `).join('');
+  // ★ 历史记录挂在场景选择页上 —— 用户说「没有历史推演记录」。
+  //   每次「提交本次推演」都会进这里；它同时是「预测坟场」的入口。
+  const hist = document.getElementById('history-holder');
+  if (hist) hist.innerHTML = renderHistoryList();
 }
 
 function startBacktest(id) {
@@ -348,9 +472,14 @@ function startBacktest(id) {
   state.paths = [];
   state.actorNotes = {};
   state.userAnswers = {};
+  state.exclusions = [];
   state.foundationNotes = '';
   state.constraintsNotes = '';
   state.externalsNotes = '';
+  state.pathNotes = '';
+  // ★ 提交状态必须重置：没提交就不许揭示历史
+  state.committed = false;
+  state.committedRunId = null;
   document.getElementById('scenario-select').style.display = 'none';
   document.getElementById('backtest-flow').style.display = 'block';
   document.getElementById('reveal-section').classList.remove('active');
@@ -417,11 +546,18 @@ function renderStepContent() {
 // --- STEP 0: Scene & Time-locked info ---
 function renderStep0() {
   const s = state.scene;
+  // ★ 修过一个 bug：原来这里写的是
+  //     <textarea id="s-decision" value="...">...</textarea>
+  //   两个错：① <textarea> 的 value 属性【无效】（HTML 规范里 textarea 的内容在标签之间）；
+  //   ② 回填读的是 currentBT.timeLocked.decisionPoint，而 collectState 写的是
+  //      state.scene.decisionPoint ⇒ 用户改完切走再回来，改动【被复原】。
+  //   现在：优先读 state，其次读锁定的原文。
+  const dp = (state.scene && state.scene.decisionPoint) || currentBT.timeLocked.decisionPoint || '';
   return `<div class="panel"><h3>📋 场景设定</h3>
     <div class="hint">以下信息是<strong>当时已知的</strong>。请基于这些信息分析，不要使用你知道的历史结果。</div>
     <div class="field"><label>场景名称（已锁定）</label><input value="${esc(s.name)}" readonly style="opacity:.7"></div>
     <div class="field"><label>核心矛盾（已锁定）</label><textarea rows="3" readonly style="opacity:.7">${esc(s.description)}</textarea></div>
-    <div class="field"><label>决策时间点（关键）</label><textarea id="s-decision" rows="2" value="${esc(currentBT.timeLocked.decisionPoint||'')}">${esc(currentBT.timeLocked.decisionPoint||'')}</textarea></div>
+    <div class="field"><label>决策时间点（关键，可修改）</label><textarea id="s-decision" rows="2">${esc(dp)}</textarea></div>
   </div>
   <div class="info-box"><strong>📌 学习目标：</strong>${currentBT.learningGoal}</div>`;
 }
@@ -554,9 +690,101 @@ function renderStep4() {
     <div class="field"><label>你的推演判断</label><textarea data-path="${i}" data-field="why" rows="2">${esc(p.why||'')}</textarea></div></div>`;
   });
   html += `<button class="btn" onclick="addPath()">+ 添加路径</button></div>`;
+  html += renderExclusions();
   html += renderGuidedQuestions(4);
-  html += '<div class="panel" style="margin-top:12px"><h3>📝 自由笔记（非必填）</h3><div class="field"><label>任何额外的分析或疑问</label><textarea data-path="free" data-field="notes" rows="2" placeholder="可选...">'+(state.pathNotes||'')+'</textarea></div></div>';
+  // ★ 修过一个 bug：这里原来是 data-path="free" data-field="notes"。
+  //   collectState 用 parseInt(el.dataset.path) 取索引，parseInt('free') = NaN
+  //   ⇒ 内容被写进 state.paths[NaN]（一个非索引属性），而
+  //   ① 渲染回填读的是 state.pathNotes（【从未被写过】）⇒ 切走再回来，笔记空白；
+  //   ② state.paths.forEach 会跳过非索引属性 ⇒ 笔记【永远进不了任何导出】。
+  //   现在改用专用属性 data-note，与数字索引彻底分开。
+  html += '<div class="panel" style="margin-top:12px"><h3>📝 自由笔记（非必填）</h3><div class="field"><label>任何额外的分析或疑问</label><textarea data-note="free" rows="3" placeholder="可选...">'+esc(state.pathNotes||'')+'</textarea></div></div>';
+  // ★ 显眼的提交区。用户报「没有提交按钮，现在是揭示历史替代了提交」——
+  //   导航栏那个按钮不够，这里再给一个把话说清楚的入口。
+  const badN = (state.exclusions || []).filter(x => x && (x.excluded || '').trim() && !(x.criterion || '').trim()).length;
+  const misN = (state.exclusions || []).filter(x => x && (x.criterion || '').trim()
+                && criterionOverlap((x.excluded || '').trim(), (x.criterion || '').trim()) === 0).length;
+  html += `<div class="panel" style="margin-top:16px;border-color:${state.committed ? 'var(--accent)' : 'var(--accent2)'}">
+    <h3>${state.committed ? '✅ 已提交' : '📤 提交本次推演'}</h3>
+    <div class="hint">写完你的推演与排除断言后，<strong>先提交，再看答案</strong>。<br>
+    提交会把这份判断写进历史并<strong>锁定</strong>；之后「揭示历史」才解锁 ——
+    否则你的判断会在看到历史结果之后改变，那就不是事前判断了。</div>
+    ${(badN || misN) ? `<div class="hint" style="color:var(--danger)">⚠️ 提交前建议先修：${badN ? '<strong>缺判据 ' + badN + ' 条</strong>　' : ''}${misN ? '<strong>判据可能不对题 ' + misN + ' 条</strong>' : ''}</div>` : ''}
+    <div style="margin-top:10px">
+      <button class="btn btn-primary" onclick="navCommit()">${state.committed ? '✔ 再提交一次（会新增一条历史）' : '✔ 提交本次推演（写入历史）'}</button>
+      <button class="btn" onclick="exportBacktest()" style="margin-left:8px">📄 导出结果（Markdown）</button>
+      <button class="btn" onclick="exportExclusions()" style="margin-left:8px">🚫 导出排除断言（JSON）</button>
+    </div>
+    ${state.committed ? `<div class="hint">本次记录 id：<code>${esc(state.committedRunId||'')}</code>　·　
+      已进历史 —— 返回场景页可看到「📚 历史推演记录」，也能一键导出全部。</div>` : ''}
+  </div>`;
   return html;
+}
+
+// --- STEP 4b: 排除断言（「什么不可能发生」）---
+// 为什么跟「路径推演」并列放在这一步：
+//   预测（会发生什么）与排除（不可能发生什么）是同一个判断的两面，
+//   但排除【更好测】—— 它单向可证伪，不需要等未来。
+function renderExclusions() {
+  let html = `<div class="panel" style="margin-top:12px">
+    <h3>🚫 我排除的路径（「不可能」断言）</h3>
+    <div class="hint">写出你认为<strong>在逻辑上不可能发生</strong>的路径。
+    每条必须填<strong>判据</strong>：<em>什么算它发生了？</em>
+    —— 没有判据的断言无法被检验，也就<strong>不携带信息</strong>。
+    但不必等未来：<strong>它一旦发生，你的断言就被证伪</strong>；它没发生，只说明尚未被证伪。</div>`;
+  (state.exclusions || []).forEach((x, i) => {
+    const crit = (x.criterion || '').trim();
+    const ov = criterionOverlap((x.excluded || '').trim(), crit);
+    const mismatch = !!crit && ov === 0;
+    const ok = !!crit && !mismatch;
+    html += `<div class="path-card" style="border-left:3px solid ${ok ? 'var(--accent)' : 'var(--danger)'}">
+      <div class="path-header">
+        <span class="prob-badge ${ok ? 'prob-h' : 'prob-l'}">排除 ${i + 1}${!crit ? ' · 缺判据' : (mismatch ? ' · 判据可能不对题' : '')}</span>
+        <button class="btn btn-sm" style="color:var(--danger);border-color:var(--danger)" onclick="removeExclusion(${i})">删除</button>
+      </div>
+      <div class="field"><label>不可能发生的路径</label>
+        <input data-exc="${i}" data-excfield="excluded" value="${esc(x.excluded || '')}"
+               placeholder="例：欧盟实现无人机生产自主化"></div>
+      <div class="field"><label>填空题 —— 如果这件事【发生了】，你会看到什么？<br>
+        <span style="color:var(--dim);font-weight:400">「它发生了」= 出现 ______</span></label>
+        <input data-exc="${i}" data-excfield="criterion" value="${esc(x.criterion || '')}"
+               placeholder="例：北约成员国军队在乌克兰境内与俄军直接交战"></div>
+      <div class="field"><label>窗口（可选，但没窗口就只是「尚未发生」）</label>
+        <input data-exc="${i}" data-excfield="window" value="${esc(x.window || '')}"
+               placeholder="例：5 年 / 至今"></div>
+      ${!crit ? '<div class="hint" style="color:var(--danger)">⚠️ 缺判据 ⇒ 这条断言不可证伪，不携带信息</div>' : ''}
+      ${mismatch ? `<div class="hint" style="color:var(--danger)">⚠️ 判据与被排除的路径【没有一个字重叠】（重叠度 ${ov.toFixed(2)}）。<br>
+        <strong>两条真实记录都栽在这里</strong>：一条填了「互撤导弹」（历史结果／预测），
+        一条填了「条约约束」（机制／理由）—— 都不是证伪条件。<br>
+        把上面那栏读成一句填空题：<strong>「它发生了」= 出现 ______</strong>，答案填在这里。<br>
+        （若两者确实语义等价、只是用词不同，忽略此提示。）</div>` : ''}
+    </div>`;
+  });
+  html += `<button class="btn" onclick="addExclusion()">+ 添加排除断言</button>`;
+  const n = (state.exclusions || []).length;
+  if (n) {
+    let bad = 0, mis = 0;
+    (state.exclusions || []).forEach(x => {
+      const c = (x.criterion || '').trim();
+      if (!c) bad++;
+      else if (criterionOverlap((x.excluded || '').trim(), c) === 0) mis++;
+    });
+    html += `<div class="hint" style="margin-top:8px">已写 ${n} 条；
+      可证伪 ${n - bad - mis} 条；<strong style="color:${bad ? 'var(--danger)' : 'var(--accent)'}">缺判据 ${bad} 条</strong>；
+      <strong style="color:${mis ? 'var(--danger)' : 'var(--accent)'}">判据可能不对题 ${mis} 条</strong></div>`;
+  }
+  html += `</div>`;
+  return html;
+}
+
+function addExclusion() {
+  if (!state.exclusions) state.exclusions = [];
+  state.exclusions.push({ excluded: '', criterion: '', window: '' });
+  render();
+}
+function removeExclusion(i) {
+  state.exclusions.splice(i, 1);
+  render();
 }
 
 // --- STEP 5: Comparison REVEAL ---
@@ -661,6 +889,7 @@ function renderStep5() {
     <button class="btn" onclick="resetToScenarios()">← 返回场景选择</button>
     <button class="btn btn-primary" onclick="resetBacktest()">🔄 重新推演</button>
     <button class="btn" onclick="exportBacktest()">📄 导出结果</button>
+    <button class="btn" onclick="exportExclusions()">🚫 导出排除断言（JSON）</button>
     <a class="btn" href="https://github.com/firehuzi/geopolitical-playfield/issues/new" target="_blank" style="text-decoration:none">💬 提交反馈</a>
   </div>`;
 
@@ -681,7 +910,20 @@ function goStep(i) {
 
 function prevStep() { if (currentStep > 0) { collectState(); currentStep--; render(); } }
 function nextStep() {
-  collectState();
+  // ★ 用户报的核心问题：「揭示历史替代了提交」。
+  //   现在在最后一步【先提交，才能揭示】—— 提交不再是可绕过的。
+  if (currentStep === 4 && !state.committed) {
+    const el = document.getElementById('save-status');
+    if (el) {
+      el.innerHTML = '⛔ <strong>还不能揭示历史</strong> —— 请先点「✔ 提交本次推演」。<br>'
+        + '<span style="color:var(--dim)">提交会把这份判断写进历史并锁定；'
+        + '之后揭示历史时，你的判断已经定下来了，改不了。</span>';
+      el.style.color = 'var(--danger)';
+    }
+    alert('请先点「✔ 提交本次推演」。\n\n提交会把这份判断写进历史并锁定，之后才能揭示历史 —— 否则你的判断会在看到答案后改变。');
+    return;
+  }
+  commitStep();          // 切步时给出「已保存」回执
   if (currentStep < 5) { currentStep++; if (currentStep===5) reveal(); render(); }
 }
 
@@ -692,8 +934,28 @@ function isStepDone(i) {
 function updateNavButtons() {
   document.getElementById('btn-prev').style.display = currentStep===0?'none':'';
   document.getElementById('btn-next').style.display = currentStep===5?'none':'';
-  if (currentStep===4) document.getElementById('btn-next').textContent = '揭示历史 🔓';
-  else document.getElementById('btn-next').textContent = '下一步 →';
+  const bc = document.getElementById('btn-commit');
+  if (bc) {
+    // 揭示之后没有可提交的输入了
+    bc.style.display = currentStep===5?'none':'';
+    // ★ 最后一步的按钮就是【提交】——用户说「揭示历史替代了提交」，
+    //   现在提交是一个独立的、必须在揭示之前完成的动作。
+    if (currentStep === 4) {
+      bc.textContent = state.committed
+        ? '✔ 已提交（' + (state.committedRunId || '') + '）· 再提交一次'
+        : '✔ 提交本次推演（写入历史）';
+      bc.className = 'btn ' + (state.committed ? '' : 'btn-primary');
+    } else {
+      bc.textContent = '✔ 保存本步';
+      bc.className = 'btn';
+    }
+  }
+  if (currentStep===4) {
+    document.getElementById('btn-next').textContent =
+      state.committed ? '揭示历史 🔓' : '揭示历史 🔒（需先提交）';
+  } else {
+    document.getElementById('btn-next').textContent = currentStep===5 ? '' : '下一步 →';
+  }
 }
 
 function collectState() {
@@ -715,11 +977,45 @@ function collectState() {
   const en = document.getElementById('ext-notes');
   if (en) state.externalsNotes = en.value;
 
+  // ★ 只收【数字索引】的 data-path。原版对所有 [data-path] 一律 parseInt，
+  //   于是 data-path="free" 被算成 NaN —— 笔记进了一个永远导不出的键。
   document.querySelectorAll('[data-path]').forEach(el=>{
-    const i = parseInt(el.dataset.path);
+    const i = parseInt(el.dataset.path, 10);
+    if (!isFinite(i)) return;                       // 非数字索引 ⇒ 跳过（不再造 NaN 键）
     if (!state.paths[i]) state.paths[i] = {label:'',probability:'medium',why:''};
     state.paths[i][el.dataset.field] = el.value;
   });
+  // 自由笔记：独立收集（原版漏了这一步的【回填】配对）
+  document.querySelectorAll('[data-note]').forEach(el=>{
+    state.pathNotes = el.value;
+  });
+}
+
+// ★ 显式提交：原版全靠切步时静默 collectState()，用户看不到「保存了没有」——
+//   这正是「自主推演没有提交按钮」的来源。现在给一个明确的提交入口 + 状态回执。
+function commitStep() {
+  collectState();
+  const nPaths = (state.paths || []).filter((p, i) => isFinite(i) && p &&
+                 (p.label || p.why)).length;
+  const nExc = (state.exclusions || []).filter(x => x && (x.excluded || x.criterion)).length;
+  const badExc = (state.exclusions || []).filter(x => x && (x.excluded || '').trim()
+                  && !(x.criterion || '').trim()).length;
+  const misExc = (state.exclusions || []).filter(x => x && (x.criterion || '').trim()
+                  && criterionOverlap((x.excluded || '').trim(), (x.criterion || '').trim()) === 0).length;
+  const nGq = Object.keys(state.userAnswers || {}).filter(k => state.userAnswers[k]).length;
+  const parts = [
+    '推演路径 ' + nPaths + ' 条',
+    '排除断言 ' + nExc + ' 条' + (badExc ? '（缺判据 ' + badExc + ' 条 ⚠️）' : '')
+                              + (misExc ? '（判据可能不对题 ' + misExc + ' 条 ⚠️）' : ''),
+    '引导题 ' + nGq + ' 题',
+    '自由笔记 ' + ((state.pathNotes || '').length) + ' 字',
+  ];
+  const el = document.getElementById('save-status');
+  if (el) {
+    el.innerHTML = '✔ <strong>已保存</strong>（第 ' + (currentStep + 1) + ' 步）　' + parts.join('　·　');
+    el.style.color = (badExc || misExc) ? 'var(--danger)' : 'var(--accent)';
+  }
+  return { nPaths, nExc, badExc, misExc, nGq };
 }
 
 function reveal() {
@@ -741,6 +1037,7 @@ function resetBacktest() {
   state.paths = [];
   state.actorNotes = {};
   state.userAnswers = {};
+  state.exclusions = [];
   state.foundationNotes = '';
   state.constraintsNotes = '';
   state.externalsNotes = '';
@@ -751,19 +1048,307 @@ function resetBacktest() {
 }
 
 function exportBacktest() {
+  collectState();        // ★ 导出前先收一遍，避免最后一刻的输入漏掉
   const ao = currentBT.actualOutcome;
   let md = `# 历史回测结果：${currentBT.name}\n\n`;
   md += `**时间点：** ${currentBT.timePoint}\n\n`;
+  // ★ 原来漏了这一项：用户在场景步改过的决策时间点（state.scene.decisionPoint）
+  const dpUser = (state.scene && state.scene.decisionPoint) || '';
+  if (dpUser && dpUser !== currentBT.timeLocked.decisionPoint) {
+    md += `**我修订的决策时间点：** ${dpUser}\n\n`;
+  }
   md += `## 我的推演\n\n`;
   state.paths.forEach(p=>{md+=`- **${p.label||'未命名'}** [概率：${p.probability||'—'}]：${p.why||''}\n`;});
   if (state.foundationNotes) md+=`\n### 底盘判断\n\n${state.foundationNotes}\n`;
   if (state.constraintsNotes) md+=`\n### 约束判断\n\n${state.constraintsNotes}\n`;
   if (state.externalsNotes) md+=`\n### 外部场域判断\n\n${state.externalsNotes}\n`;
+  // ★ 原来完全漏了自由笔记（它被写进了导不出的 NaN 键里）
+  if (state.pathNotes) md+=`\n### 自由笔记\n\n${state.pathNotes}\n`;
   Object.entries(state.actorNotes).forEach(([k,v])=>{if(v) md+=`\n### ${esc(state.actors[k]?.name||'行为体'+k)}决策者判断\n\n${v}\n`;});
+
+  // ★ 排除断言一段。判据缺了就地标红 —— 不静默放过。
+  const rec = buildExclusionRecord(currentBT, state, '（未导出 JSON）');
+  if (rec.exclusions.length) {
+    md += `\n## 我排除的路径（「不可能」断言）\n\n`;
+    md += `> 共 ${rec.summary.total} 条，可证伪 ${rec.summary.falsifiable} 条，`;
+    md += `不可证伪 ${rec.summary.unfalsifiable} 条。\n\n`;
+    rec.exclusions.forEach(x=>{
+      md += `- **${x.excluded||'（未填）'}**\n`;
+      if (x.criterion_mismatch) {
+        md += `  - ⚠️ **判据可能不对题**：填的是「${x.criterion}」，与被排除的路径零词面重叠\n`;
+        md += `  - 常见原因：把「我认为会怎么走」（路径预测）填进了判据栏\n`;
+        md += `  - 判据要填的是【证伪条件】：出现什么，就说明你排除的那件事发生了\n`;
+      } else if (x.falsifiable) {
+        md += `  - 证伪条件：${x.criterion}\n`;
+        md += `  - 窗口：${x.window||'未填 —— 那它目前只是「尚未发生」'}\n`;
+        md += `  - 状态：尚未被证伪（写下时）\n`;
+      } else {
+        md += `  - ⚠️ **未填判据 ⇒ 这条断言不可证伪，不携带信息**\n`;
+      }
+    });
+    if (rec.summary.unfalsifiable || rec.summary.criterion_mismatch) {
+      md += `\n> ⚠️ `;
+      if (rec.summary.unfalsifiable)
+        md += `有 ${rec.summary.unfalsifiable} 条断言缺判据（${rec.summary.unfalsifiable_ids.join('、')}）。`;
+      if (rec.summary.criterion_mismatch)
+        md += `有 ${rec.summary.criterion_mismatch} 条判据可能不对题（${rec.summary.criterion_mismatch_ids.join('、')}）。`;
+      md += `\n> 不可证伪的断言与不可证伪的预测一样：**不携带信息**。\n`;
+    }
+  }
+
   md+=`\n## 历史实际\n\n${ao.summary}\n\n### 关键因素\n\n`;
   ao.keyFactors.forEach(kf=>{md+=`- ${kf}\n`;});
   md+=`\n### 复盘洞察\n\n${ao.learningPoints}\n`;
   download(md,`backtest-${currentBT.id}.md`,'text/markdown');
+}
+
+// ★ 结构化导出：给对账器吃的格式（schema = construct-exclusion-v1）
+function exportExclusions() {
+  const el = document.getElementById('save-status');
+  const say = (msg, bad) => {
+    if (el) { el.innerHTML = msg; el.style.color = bad ? 'var(--danger)' : 'var(--accent)'; }
+  };
+  // ★ 修：原版 !currentBT 时【完全静默】return，用户只会看到「点了没反应」。
+  if (!currentBT) {
+    say('⛔ 还没选场景 ⇒ 没有可导出的东西。请先在上方选一个场景。', true);
+    alert('还没有选场景。请先在页面上选一个场景，走到最后一步再导出。');
+    return;
+  }
+  collectState();        // 导出前先收一遍，避免最后一刻的输入漏掉
+  const rec = buildExclusionRecord(currentBT, state, new Date().toISOString());
+
+  // ★ 修：原版在【一条都没写】时直接 return 不产文件 —— 于是「没文件」有两种含义
+  //   （没点按钮 / 点了但没东西），分不清。现在即使空也照样导出：
+  //   空记录本身是信息（「我没做排除断言」），且让失败模式变得可区分。
+  const problems = [];
+  if (rec.summary.unfalsifiable)
+    problems.push('有 ' + rec.summary.unfalsifiable + ' 条【缺判据】，不可证伪，不携带信息。');
+  if (rec.summary.criterion_mismatch)
+    problems.push('有 ' + rec.summary.criterion_mismatch + ' 条【判据可能不对题】'
+                  + '（与被排除的路径零词面重叠）—— 很可能把「我认为会怎么走」填进了判据栏。');
+  if (rec.summary.total === 0)
+    problems.push('你【一条排除断言都没写】。导出的会是一份空记录 —— 这本身也是信息，'
+                  + '但如果你本来想写，请先写。');
+  if (problems.length) {
+    if (!confirm(problems.join('\n\n') + '\n\n仍然导出吗？')) {
+      say('已取消导出。（没有下载任何文件）', true);
+      return;
+    }
+  }
+  download(JSON.stringify(rec, null, 2),
+           `exclusions-${currentBT.id}.json`, 'application/json');
+  say('📄 <strong>已导出</strong> exclusions-' + currentBT.id + '.json　（排除断言 '
+      + rec.summary.total + ' 条）' + (rec.summary.total === 0 ? '　⚠️ 一条都没写' : ''),
+      rec.summary.total === 0 || rec.summary.unfalsifiable > 0 || rec.summary.criterion_mismatch > 0);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 提交 与 历史记录
+// ══════════════════════════════════════════════════════════════
+// ★ 用户的原话：「还是没有提交按钮，现在是揭示历史替代了提交」＋「没有历史推演记录」。
+//   这两句是同一件事：写推演 →【揭示历史直接看答案】，中间缺一个把判断【定下来】的动作。
+//   「保存本步」只是草稿保存，不是提交。
+//   ⇒ 现在把「提交」做成真动作：写进历史（localStorage），并【解锁】揭示历史。
+//     没提交就揭示不了 —— 提交不再能被绕过。
+const HISTORY_KEY = 'construct_backtests_v1';
+
+function loadHistory() {
+  try {
+    const raw = (typeof localStorage !== 'undefined') ? localStorage.getItem(HISTORY_KEY) : null;
+    const h = raw ? JSON.parse(raw) : [];
+    return Array.isArray(h) ? h : [];
+  } catch (e) { return []; }
+}
+function saveHistory(h) {
+  try {
+    if (typeof localStorage === 'undefined') return false;
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
+    return true;
+  } catch (e) { return false; }
+}
+
+// 一次完整推演的记录（提交时才生成）—— 这是「预测坟场」要装的东西
+function buildRunRecord(bt, st, nowISO) {
+  const rec = buildExclusionRecord(bt, st, nowISO);
+  const paths = (st.paths || []).filter((p, i) => isFinite(i) && p && (p.label || p.why))
+                  .map(p => ({ label: p.label || '', probability: p.probability || '', why: p.why || '' }));
+  const gq = {};
+  Object.keys(st.userAnswers || {}).forEach(k => { if (st.userAnswers[k]) gq[k] = st.userAnswers[k]; });
+  const bad = (rec.summary.unfalsifiable || 0) + (rec.summary.criterion_mismatch || 0);
+  return {
+    schema: 'construct-run-v1',
+    run_id: bt.id + '-' + String(nowISO).replace(/[^0-9]/g, '').slice(0, 14),
+    committed_at: nowISO,
+    scenario: bt.name,
+    scenario_id: bt.id,
+    time_lock: bt.timePoint,
+    time_lock_revised: (st.scene && st.scene.decisionPoint) || null,
+    paths: paths,
+    actor_notes: st.actorNotes || {},
+    foundation_notes: st.foundationNotes || '',
+    constraints_notes: st.constraintsNotes || '',
+    externals_notes: st.externalsNotes || '',
+    free_notes: st.pathNotes || '',
+    guided_answers: gq,
+    exclusions: rec.exclusions,
+    exclusion_summary: rec.summary,
+    readout: {
+      paths: paths.length,
+      exclusions: rec.summary.total,
+      unfalsifiable: rec.summary.unfalsifiable,
+      criterion_mismatch: rec.summary.criterion_mismatch,
+      problem_ratio: rec.summary.total ? bad / rec.summary.total : null
+    }
+  };
+}
+
+function commitBacktest() {
+  const el = document.getElementById('save-status');
+  const say = (m, bad) => { if (el) { el.innerHTML = m; el.style.color = bad ? 'var(--danger)' : 'var(--accent)'; } };
+  if (!currentBT) { say('⛔ 还没选场景。', true); return null; }
+  collectState();
+  const rec = buildRunRecord(currentBT, state, new Date().toISOString());
+  if (rec.exclusions.length === 0) {
+    if (!confirm('你【没有写任何排除断言】—— 这份记录里没有可检验的东西。\n\n仍然提交吗？')) {
+      say('已取消提交。', true);
+      return null;
+    }
+  }
+  const h = loadHistory();
+  h.unshift(rec);
+  const okSaved = saveHistory(h);
+  state.committed = true;
+  state.committedRunId = rec.run_id;
+  const r = rec.readout;
+  const bad = (r.unfalsifiable || 0) + (r.criterion_mismatch || 0);
+  say('✔ <strong>已提交</strong> ' + rec.run_id + '　·　路径 ' + r.paths + ' 条　·　排除断言 '
+      + r.exclusions + ' 条' + (bad ? '（有问题 ' + bad + ' 条 ⚠️）' : '')
+      + '　·　已进历史（第 ' + h.length + ' 次）'
+      + (okSaved ? '' : '　⚠️ 本机存储写入失败（历史只在本次会话有效）'),
+      !okSaved || bad > 0);
+  return rec;
+}
+
+function exportHistory() {
+  const h = loadHistory();
+  if (!h.length) { alert('历史里还没有记录。走完一个场景、点「✔ 提交本次推演」后就有了。'); return; }
+  download(JSON.stringify({ schema: 'construct-history-v1', exported_at: new Date().toISOString(),
+                            count: h.length, runs: h }, null, 2),
+           'construct-history.json', 'application/json');
+}
+
+function deleteHistoryRun(runId) {
+  if (!confirm('删除这条历史记录？\n' + runId)) return;
+  saveHistory(loadHistory().filter(r => r.run_id !== runId));
+  renderScenarioGrid();
+}
+
+function renderHistoryList() {
+  const h = loadHistory();
+  if (!h.length) return '';
+  let html = '<div class="panel" style="margin-top:20px"><h3>📚 历史推演记录（' + h.length + ' 次）</h3>'
+    + '<div class="hint">每次「提交本次推演」都会留在这里。'
+    + '这是「预测坟场」要装的东西 —— 失败的、不可证伪的，都要留着。</div>'
+    + '<div style="margin-top:10px"><button class="btn" onclick="exportHistory()">⬇ 导出全部历史（JSON）</button></div>';
+  h.forEach(r => {
+    const q = r.readout || {};
+    const bad = (q.unfalsifiable || 0) + (q.criterion_mismatch || 0);
+    html += '<div class="path-card" style="margin-top:10px">'
+      + '<div class="path-header"><span class="prob-badge ' + (bad ? 'prob-l' : 'prob-h') + '">'
+      + esc(r.scenario) + '</span>'
+      + '<button class="btn btn-sm" style="color:var(--danger);border-color:var(--danger)" '
+      + 'onclick="deleteHistoryRun(\'' + r.run_id + '\')">删除</button></div>'
+      + '<div class="hint" style="font-size:11px">'
+      + '提交于 ' + esc(String(r.committed_at || '').replace('T', ' ').slice(0, 19)) + '　·　'
+      + '路径 ' + (q.paths || 0) + ' 条　·　排除断言 ' + (q.exclusions || 0) + ' 条　·　'
+      + (q.exclusions
+          ? '有问题 <strong style="color:' + (bad ? 'var(--danger)' : 'var(--accent)') + '">' + bad + '</strong> 条'
+          : '⚠️ 无排除断言')
+      + '</div></div>';
+  });
+  html += '</div>';
+  return html;
+}
+
+// 导航上的提交按钮：最后一步是【提交】，其余步是【保存本步】。
+// 抽出来是为了让按钮行为与 updateNavButtons 的标签一致（原来是硬编码 commitStep）。
+function navCommit() {
+  if (currentStep === 4) {
+    const rec = commitBacktest();
+    if (rec) render();      // 重渲染：按钮变「已提交」、揭示按钮解锁
+  } else {
+    commitStep();
+  }
+}
+
+// ★ 自证：这段逻辑必须能【失败】才可信。控制台里调 selfTestExclusion()。
+//   ★ 改过一轮：原来占位符用 'X' / 'Y≥1' / 'Y'，它们互相零重叠 ——
+//     加了「判据对不对题」检查后，那几条自己变成了「不对题」，断言全崩。
+//     改用【真实形状的中文对】，并补上不对题方向。
+function selfTestExclusion() {
+  const bt = {id:'t', name:'T', timePoint:'X'};
+  let n = 0, fail = 0;
+  const ck = (name, cond, detail) => {
+    if (cond) { n++; console.log('  ✅ ' + name); }
+    else { fail++; console.log('  ❌ ' + name + '   ' + (detail || '')); }
+  };
+
+  // 0) 重叠度：中文必须保住（防 JS 的 \W 把中文剥光那个坑）
+  ck('★重叠度：同一串中文得 1', criterionOverlap('中国', '中国') === 1);
+  ck('★重叠度：真实那一对（核战前奏 vs 互撤导弹）得 0',
+     criterionOverlap('危机局势进一步加剧 进入核战前奏', '互撤导弹') === 0);
+  ck('重叠度：对题的一对 > 0',
+     criterionOverlap('欧盟自主建军', '欧盟把防务预算主权上交') > 0);
+
+  // 1) 缺判据 ⇒ 不可证伪（这是整个扩展的目的）
+  let r = buildExclusionRecord(bt, {exclusions:[{excluded:'欧盟自主建军', criterion:'', window:'5年'}]}, 'now');
+  ck('缺判据 ⇒ falsifiable=false', r.exclusions[0].falsifiable === false);
+  ck('缺判据 ⇒ 计入 unfalsifiable', r.summary.unfalsifiable === 1);
+  ck('缺判据 ⇒ note 说明「不携带信息／无法被检验」',
+     /不携带信息|无法被检验/.test(r.exclusions[0].note), r.exclusions[0].note);
+
+  // 2) 判据对题且有窗口 ⇒ 可证伪
+  r = buildExclusionRecord(bt, {exclusions:[
+      {excluded:'欧盟自主建军', criterion:'欧盟把防务预算主权上交', window:'5年'}]}, 'now');
+  ck('判据对题 ⇒ falsifiable=true', r.exclusions[0].falsifiable === true);
+  ck('判据对题 ⇒ unfalsifiable=0', r.summary.unfalsifiable === 0);
+  ck('判据对题 ⇒ criterion_mismatch=0', r.summary.criterion_mismatch === 0);
+
+  // 3) ★判据不对题 ⇒ 单列（真实记录打出来的那一档）
+  r = buildExclusionRecord(bt, {exclusions:[
+      {excluded:'危机局势进一步加剧 进入核战前奏', criterion:'互撤导弹', window:'3年'}]}, 'now');
+  ck('★判据零重叠 ⇒ criterion_mismatch=true', r.exclusions[0].criterion_mismatch === true);
+  ck('★判据零重叠 ⇒ falsifiable=false（不算成可证伪）', r.exclusions[0].falsifiable === false);
+  ck('★判据零重叠 ⇒ summary 单列计数与 id',
+     r.summary.criterion_mismatch === 1 && r.summary.criterion_mismatch_ids[0] === 't-X01');
+  ck('★判据零重叠 ⇒ note 指出可能把路径预测填进判据栏',
+     /路径预测|证伪条件/.test(r.exclusions[0].note), r.exclusions[0].note);
+
+  // 4) 判据只有空白字符 ⇒ 也算缺（必须 trim）
+  r = buildExclusionRecord(bt, {exclusions:[{excluded:'欧盟自主建军', criterion:'   ', window:''}]}, 'now');
+  ck('★判据只有空格 ⇒ 也算缺（trim）', r.exclusions[0].falsifiable === false);
+
+  // 5) 有判据但无窗口 ⇒ 仍可证伪，但要单列提醒
+  r = buildExclusionRecord(bt, {exclusions:[
+      {excluded:'欧盟自主建军', criterion:'欧盟把防务预算主权上交', window:''}]}, 'now');
+  ck('有判据无窗口 ⇒ 仍可证伪', r.exclusions[0].falsifiable === true);
+  ck('有判据无窗口 ⇒ 计入 missing_window_ids', r.summary.missing_window_ids.length === 1);
+
+  // 6) 边界
+  r = buildExclusionRecord(bt, {exclusions:[]}, 'now');
+  ck('空列表 ⇒ total=0 且不报错', r.summary.total === 0);
+  r = buildExclusionRecord(bt, {}, 'now');
+  ck('exclusions 未定义 ⇒ 不崩', r.summary.total === 0);
+
+  // 7) id 稳定有序
+  r = buildExclusionRecord(bt, {exclusions:[
+      {excluded:'欧盟自主建军', criterion:'欧盟把防务预算主权上交'},
+      {excluded:'伊朗承认以色列', criterion:'伊朗与以色列建交'}]}, 'now');
+  ck('id 稳定有序', r.exclusions[0].id === 't-X01' && r.exclusions[1].id === 't-X02',
+     r.exclusions.map(x=>x.id).join(','));
+
+  console.log(`自证：通过 ${n}，失败 ${fail}`);
+  return fail === 0;
 }
 
 // ============================================================
@@ -777,12 +1362,24 @@ document.addEventListener('input', function(e) {
   const t = e.target;
   if (t.dataset.actor !== undefined) state.actorNotes[t.dataset.actor] = t.value;
   if (t.dataset.path !== undefined) {
-    const i = parseInt(t.dataset.path);
-    if (!state.paths[i]) state.paths[i] = {label:'',probability:'medium',why:''};
-    state.paths[i][t.dataset.field] = t.value;
+    // ★ 与 collectState 同修：非数字索引直接跳过，不再造 NaN 键
+    const i = parseInt(t.dataset.path, 10);
+    if (isFinite(i)) {
+      if (!state.paths[i]) state.paths[i] = {label:'',probability:'medium',why:''};
+      state.paths[i][t.dataset.field] = t.value;
+    }
   }
+  // ★ 自由笔记：边打边存（原版这里也把它算成 NaN 索引）
+  if (t.dataset.note !== undefined) state.pathNotes = t.value;
   // Guided questions (text type)
   if (t.dataset.gq !== undefined) state.userAnswers[t.dataset.gq] = t.value;
+  // ★ 排除断言：三栏都要收（判据那一栏是关键，缺它这条断言就不可证伪）
+  if (t.dataset.exc !== undefined) {
+    const i = parseInt(t.dataset.exc);
+    if (!state.exclusions) state.exclusions = [];
+    if (!state.exclusions[i]) state.exclusions[i] = { excluded: '', criterion: '', window: '' };
+    state.exclusions[i][t.dataset.excfield] = t.value;
+  }
 });
 document.addEventListener('change', function(e) {
   const t = e.target;
